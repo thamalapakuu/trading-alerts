@@ -1751,15 +1751,10 @@ async def save_alert(
 
 
             "✅ Alert Saved\n\n"
-
             f"📊 Symbol: {symbol}\n"
-
             f"💵 Current: {format_market_price(symbol, current_price)}\n"
-
             f"🎯 Target: {format_market_price(symbol, target)}\n"
-
             f"📈 Direction: {direction}\n\n"
-
             "🚀 Monitoring Started",
 
 
