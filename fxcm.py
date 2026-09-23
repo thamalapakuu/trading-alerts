@@ -15,12 +15,8 @@ from forexconnect import (
 # SETTINGS
 # ==================================================
 
-# If a quote has not changed for this many seconds
-# during an active FX trading period, consider the
-# price feed stale.
 STALE_PRICE_SECONDS = 180
 
-# Prevent continuous reconnect attempts.
 RECONNECT_COOLDOWN_SECONDS = 60
 
 
@@ -81,14 +77,12 @@ FXCM_SYMBOL_MAP = {
 
 fx_connection = None
 
-fx_session_status = None
-
 connection_lock = threading.RLock()
 
 last_reconnect_attempt = 0.0
 
 
-# Stores the last price we observed for every symbol.
+# Stores last observed bid / ask for each symbol.
 #
 # Example:
 #
@@ -99,7 +93,7 @@ last_reconnect_attempt = 0.0
 #         "changed_at": 123456.78
 #     }
 # }
-#
+
 last_quotes = {}
 
 
@@ -128,18 +122,22 @@ def normalize_symbol(symbol):
 
 def forex_market_should_be_active():
     """
-    Conservative check used only for stale-price detection.
+    Used only for stale-price detection.
 
-    We deliberately avoid considering Saturday/Sunday
-    daytime quotes stale because FX markets are normally
-    closed then.
+    Monday-Thursday:
+        active
 
-    Monday-Friday are treated as active.
+    Friday:
+        active until approximately 22:00 UTC
 
-    Late Friday UTC is excluded to reduce unnecessary
-    reconnect attempts after the weekly close.
+    Saturday:
+        inactive
 
-    Sunday night UTC is allowed for the weekly reopen.
+    Sunday:
+        active after approximately 22:00 UTC
+
+    This prevents the bot from repeatedly reconnecting
+    simply because markets are closed for the weekend.
     """
 
     now = datetime.now(timezone.utc)
@@ -159,59 +157,21 @@ def forex_market_should_be_active():
         return True
 
     if weekday == 4:
-        # Conservative Friday cutoff.
         return hour < 22
 
     if weekday == 6:
-        # Conservative Sunday reopen.
         return hour >= 22
 
     return False
 
 
 # ==================================================
-# SESSION STATUS TEXT
-# ==================================================
-
-def session_status_name(status):
-
-    try:
-        return str(status)
-    except Exception:
-        return "UNKNOWN"
-
-
-# ==================================================
-# SESSION STATUS CALLBACK
-# ==================================================
-
-def on_session_status_changed(session, status):
-
-    global fx_session_status
-    global fx_connection
-
-    fx_session_status = status
-
-    print(
-        f"🔌 FXCM session status: "
-        f"{session_status_name(status)}",
-        flush=True,
-    )
-
-    # Do not perform another login directly inside this
-    # callback. ForexConnect itself may be transitioning.
-    #
-    # get_price() will reconnect when necessary.
-
-
-# ==================================================
-# CHECK WHETHER SESSION REPORTS CONNECTED
+# CHECK SESSION
 # ==================================================
 
 def session_is_connected():
 
     global fx_connection
-    global fx_session_status
 
     if fx_connection is None:
         return False
@@ -220,30 +180,17 @@ def session_is_connected():
 
         status = fx_connection.session.session_status
 
-        return (
-            status
-            == fxcorepy.AO2GSessionStatus
+        connected_status = (
+            fxcorepy
+            .AO2GSessionStatus
             .O2GSessionStatus
             .CONNECTED
         )
 
+        return status == connected_status
+
     except Exception:
-
-        # If this ForexConnect build behaves differently,
-        # fall back to the status reported by callback.
-
-        try:
-
-            return (
-                fx_session_status
-                == fxcorepy.AO2GSessionStatus
-                .O2GSessionStatus
-                .CONNECTED
-            )
-
-        except Exception:
-
-            return False
+        return False
 
 
 # ==================================================
@@ -253,26 +200,15 @@ def session_is_connected():
 def close_fxcm():
 
     global fx_connection
-    global fx_session_status
 
     with connection_lock:
 
         old_connection = fx_connection
 
         fx_connection = None
-        fx_session_status = None
 
         if old_connection is None:
             return
-
-        try:
-
-            old_connection.set_session_status_listener(
-                None
-            )
-
-        except Exception:
-            pass
 
         try:
 
@@ -298,9 +234,12 @@ def close_fxcm():
 def init_fxcm(force=False):
 
     global fx_connection
-    global fx_session_status
 
     with connection_lock:
+
+        # ------------------------------------------
+        # Existing healthy connection
+        # ------------------------------------------
 
         if (
             not force
@@ -317,7 +256,7 @@ def init_fxcm(force=False):
 
 
         # ------------------------------------------
-        # Clean old connection first
+        # Remove old connection
         # ------------------------------------------
 
         if fx_connection is not None:
@@ -327,14 +266,9 @@ def init_fxcm(force=False):
             fx_connection = None
 
             try:
-                old_connection.set_session_status_listener(
-                    None
-                )
-            except Exception:
-                pass
 
-            try:
                 old_connection.logout()
+
             except Exception:
                 pass
 
@@ -343,25 +277,43 @@ def init_fxcm(force=False):
         # Environment variables
         # ------------------------------------------
 
-        username = os.getenv("FXCM_USERNAME")
-        password = os.getenv("FXCM_PASSWORD")
-        url = os.getenv("FXCM_URL")
+        username = os.getenv(
+            "FXCM_USERNAME"
+        )
+
+        password = os.getenv(
+            "FXCM_PASSWORD"
+        )
+
+        url = os.getenv(
+            "FXCM_URL"
+        )
+
 
         if not username:
+
             raise Exception(
                 "FXCM_USERNAME missing"
             )
 
+
         if not password:
+
             raise Exception(
                 "FXCM_PASSWORD missing"
             )
 
+
         if not url:
+
             raise Exception(
                 "FXCM_URL missing"
             )
 
+
+        # ------------------------------------------
+        # Connect
+        # ------------------------------------------
 
         print(
             "🔄 Connecting FXCM...",
@@ -369,35 +321,8 @@ def init_fxcm(force=False):
         )
 
 
-        # ------------------------------------------
-        # Create new ForexConnect session
-        # ------------------------------------------
-
         fx = ForexConnect()
 
-
-        # ------------------------------------------
-        # Register session-status listener
-        # ------------------------------------------
-
-        try:
-
-            fx.set_session_status_listener(
-                on_session_status_changed
-            )
-
-        except Exception as e:
-
-            print(
-                "⚠️ Could not install FXCM "
-                f"session listener: {e}",
-                flush=True,
-            )
-
-
-        # ------------------------------------------
-        # Login
-        # ------------------------------------------
 
         try:
 
@@ -419,17 +344,6 @@ def init_fxcm(force=False):
 
 
         fx_connection = fx
-
-
-        try:
-
-            fx_session_status = (
-                fx.session.session_status
-            )
-
-        except Exception:
-
-            fx_session_status = None
 
 
         print(
@@ -454,6 +368,10 @@ def get_connection():
         return init_fxcm()
 
 
+    # ----------------------------------------------
+    # Check whether FXCM reports connected
+    # ----------------------------------------------
+
     if not session_is_connected():
 
         print(
@@ -475,6 +393,7 @@ def get_connection():
 
 def reconnect_fxcm(reason="unknown"):
 
+    global fx_connection
     global last_reconnect_attempt
 
     with connection_lock:
@@ -482,12 +401,13 @@ def reconnect_fxcm(reason="unknown"):
         now = time.monotonic()
 
         elapsed = (
-            now - last_reconnect_attempt
+            now
+            - last_reconnect_attempt
         )
 
 
         # ------------------------------------------
-        # Reconnect cooldown
+        # Prevent rapid reconnect loops
         # ------------------------------------------
 
         if (
@@ -515,23 +435,15 @@ def reconnect_fxcm(reason="unknown"):
 
 
         # ------------------------------------------
-        # Destroy existing connection
+        # Close existing connection
         # ------------------------------------------
 
         old_connection = fx_connection
 
-        globals()["fx_connection"] = None
+        fx_connection = None
+
 
         if old_connection is not None:
-
-            try:
-
-                old_connection.set_session_status_listener(
-                    None
-                )
-
-            except Exception:
-                pass
 
             try:
 
@@ -541,13 +453,14 @@ def reconnect_fxcm(reason="unknown"):
                 pass
 
 
-        # Give native ForexConnect a very small amount
-        # of time to release the old session.
+        # Give the native library a moment
+        # to release the previous session.
+
         time.sleep(1)
 
 
         # ------------------------------------------
-        # New login
+        # Start new connection
         # ------------------------------------------
 
         new_connection = init_fxcm(
@@ -555,8 +468,9 @@ def reconnect_fxcm(reason="unknown"):
         )
 
 
-        # After reconnect the previous quote-age
-        # measurements are no longer useful.
+        # Previous quote ages should no longer
+        # carry over after reconnecting.
+
         last_quotes.clear()
 
 
@@ -592,8 +506,14 @@ def _read_offer(fx, symbol):
 
         if fx_symbol == symbol:
 
-            bid = float(row.bid)
-            ask = float(row.ask)
+            bid = float(
+                row.bid
+            )
+
+            ask = float(
+                row.ask
+            )
+
 
             return {
                 "symbol": row.instrument,
@@ -609,7 +529,11 @@ def _read_offer(fx, symbol):
 # UPDATE QUOTE HEALTH
 # ==================================================
 
-def _update_quote_health(symbol, bid, ask):
+def _update_quote_health(
+    symbol,
+    bid,
+    ask,
+):
 
     now = time.monotonic()
 
@@ -618,9 +542,9 @@ def _update_quote_health(symbol, bid, ask):
     )
 
 
-    # ------------------------------------------
-    # First observation
-    # ------------------------------------------
+    # ----------------------------------------------
+    # First quote
+    # ----------------------------------------------
 
     if previous is None:
 
@@ -630,6 +554,7 @@ def _update_quote_health(symbol, bid, ask):
             "changed_at": now,
         }
 
+
         return {
             "changed": True,
             "age": 0.0,
@@ -637,9 +562,9 @@ def _update_quote_health(symbol, bid, ask):
         }
 
 
-    # ------------------------------------------
-    # Price changed
-    # ------------------------------------------
+    # ----------------------------------------------
+    # Quote changed
+    # ----------------------------------------------
 
     if (
         previous["bid"] != bid
@@ -650,6 +575,7 @@ def _update_quote_health(symbol, bid, ask):
         previous["ask"] = ask
         previous["changed_at"] = now
 
+
         return {
             "changed": True,
             "age": 0.0,
@@ -657,9 +583,9 @@ def _update_quote_health(symbol, bid, ask):
         }
 
 
-    # ------------------------------------------
-    # Price unchanged
-    # ------------------------------------------
+    # ----------------------------------------------
+    # Quote unchanged
+    # ----------------------------------------------
 
     age = (
         now
@@ -686,8 +612,6 @@ def _update_quote_health(symbol, bid, ask):
 
 def get_price(symbol):
 
-    global fx_connection
-
     original_symbol = symbol
 
     symbol = normalize_symbol(
@@ -695,7 +619,7 @@ def get_price(symbol):
     )
 
 
-    # We allow one reconnect/retry.
+    # Allow one reconnect / retry.
     for attempt in range(2):
 
         try:
@@ -725,7 +649,7 @@ def get_price(symbol):
 
 
             # --------------------------------------
-            # Sanity check
+            # Sanity checks
             # --------------------------------------
 
             if bid <= 0 or ask <= 0:
@@ -747,7 +671,7 @@ def get_price(symbol):
 
 
             # --------------------------------------
-            # Quote freshness
+            # Track quote freshness
             # --------------------------------------
 
             health = _update_quote_health(
@@ -758,7 +682,7 @@ def get_price(symbol):
 
 
             # --------------------------------------
-            # Stale quote
+            # Stale quote detected
             # --------------------------------------
 
             if health["stale"]:
@@ -766,6 +690,7 @@ def get_price(symbol):
                 age = int(
                     health["age"]
                 )
+
 
                 print(
                     f"⚠️ STALE FXCM PRICE | "
@@ -776,6 +701,9 @@ def get_price(symbol):
                     flush=True,
                 )
 
+
+                # First detection:
+                # reconnect and try once more.
 
                 if attempt == 0:
 
@@ -790,9 +718,8 @@ def get_price(symbol):
                     continue
 
 
-                # Most important safety feature:
-                # do NOT return a stale quote to
-                # the alert monitor.
+                # Never allow a stale quote
+                # to reach the alert monitor.
 
                 raise Exception(
                     f"FXCM stale price for "
@@ -801,7 +728,7 @@ def get_price(symbol):
 
 
             # --------------------------------------
-            # Good quote
+            # Valid live quote
             # --------------------------------------
 
             return {
@@ -820,7 +747,7 @@ def get_price(symbol):
 
 
         # ------------------------------------------
-        # Invalid symbol
+        # Invalid / unsupported symbol
         # ------------------------------------------
 
         except LookupError:
@@ -831,7 +758,7 @@ def get_price(symbol):
 
 
         # ------------------------------------------
-        # Connection / feed error
+        # FXCM / connection error
         # ------------------------------------------
 
         except Exception as e:
@@ -855,6 +782,7 @@ def get_price(symbol):
                     )
 
                     continue
+
 
                 except Exception as reconnect_error:
 
@@ -885,17 +813,28 @@ def validate_symbol(symbol):
     )
 
 
-    # Common supported list
+    # ----------------------------------------------
+    # Known symbols
+    # ----------------------------------------------
+
     if symbol in COMMON_FOREX:
+
         return True
+
 
     if symbol in COMMON_COMMODITIES:
+
         return True
 
+
+    # ----------------------------------------------
+    # Check FXCM offers table
+    # ----------------------------------------------
 
     try:
 
         fx = get_connection()
+
 
         offers = fx.get_table(
             fxcorepy.O2GTableType.OFFERS
@@ -913,6 +852,7 @@ def validate_symbol(symbol):
 
 
             if fx_symbol == symbol:
+
                 return True
 
 
