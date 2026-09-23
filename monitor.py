@@ -412,19 +412,14 @@ async def process_alert(
 
     message = (
         "🚨 PRICE ALERT HIT\n\n"
-
         f"📊 Symbol:\n"
         f"{symbol}\n\n"
-
         f"📍 Direction:\n"
         f"{direction}\n\n"
-
         f"🎯 Target:\n"
         f"{format_price(symbol, target)}\n\n"
-
         f"💰 Current Price:\n"
         f"{format_price(symbol, alert_price)}\n\n"
-
         "✅ Alert Completed"
     )
 
